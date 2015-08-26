@@ -165,7 +165,7 @@ module Make(T : TOKEN) = struct
     let pp ppf x =
       let k, x =
         match x with Terminal x -> "t", x | NonTerminal x -> "nt", x in
-      fmt ppf "%s %s" k (T.to_string x)
+      fmt ppf "%s" (T.to_string x)
 
     let compare a b =
       let ret x = x
@@ -194,14 +194,21 @@ module Make(T : TOKEN) = struct
                        | c -> c
   end
 
-  (* Earley 'item' *)
+  (* Earley 'item':
+   * the integer is the parsing round the item was generated from
+   * the symbol is the rule lhs, ie. the symbol it reduces to
+   * the first 'rhs' is the recognised part so far (ie the left side of the dot)
+   * the second 'rhs' is the remaining of the rule *)
   module Item = struct
-    type t = int * Rhs.t
 
-    let compare (k1,l1) (k2,l2) =
-      match compare k1 k2 with
-        0 -> Rhs.compare l1 l2
-      | r -> r
+    type t = int * Symbol.t * Rhs.t * Rhs.t
+
+    let compare (k1,s1,l1,r1) (k2,s2,l2,r2) =
+      match compare k1 k2, Symbol.compare s1 s2, Rhs.compare l1 l2, Rhs.compare r1 r2 with
+      | 0, 0, 0, r
+      | 0, 0, r, _
+      | 0, r, _, _
+      | r, _, _, _ -> r
 
   end
 
@@ -210,6 +217,7 @@ module Make(T : TOKEN) = struct
   module RuleMap = MultiMap.Make(Symbol)(Rhs)
 
   module ItemMap = MultiMap.Make(Symbol)(Item)
+  module ItemSet = ItemMap.Set
 
   (* result of a reduced item *)
   module ItemSymbol = struct
@@ -222,8 +230,9 @@ module Make(T : TOKEN) = struct
 
   module SymbolMap = Map.Make(Symbol)
   module SymbolSet = Set.Make(Symbol)
+                             (*
   module ItemSymbolSet = Set.Make(ItemSymbol)
-
+                              *)
   type rulemap =  RuleMap.t
 
   type itemmap = ItemMap.t
@@ -248,29 +257,44 @@ module Make(T : TOKEN) = struct
       let elts = SymbolSet.elements s in
       fmt ppf "@[%a@]" (seq ~sep:symbol_sep symbol) elts
 
+
+    let completed ppf (r,sy) = fmt ppf "%a @@%d" symbol sy r
+
+    let completed_list ppf l = seq ~sep:symbol_sep completed ppf l
+(*
     let itemsymbolset sep ppf s =
       ItemSymbolSet.iter (fun (r,tk) -> fmt ppf "%a @@%d;" symbol tk r) s
-
+ *)
     let rule_sep ppf () = fmt ppf "@ "
 
-    let pp ppf (n,rhs) =
-      fmt ppf "@[%a ::= %a@]" symbol n (seq ~sep:rule_sep symbol) rhs
+    let rhs ppf r =
+      seq ~sep:rule_sep symbol ppf r
+
+    let pp ppf (n,r) =
+      fmt ppf "@[%a ::= %a@]" symbol n rhs r
 
     let rulemap ppf (rs : rulemap) =
       fmt ppf "@[<2>%a@]" (fun ppf ->
                            RuleMap.iter (fun r rhs -> fmt ppf "%a@." pp (r,rhs))) rs
 
     let item_sep ppf () = fmt ppf "@."
-    let item ppf (r,(k,rhs)) = fmt ppf "%a @@%d" pp (r,rhs) k
+
+    let item ppf (k,n,rhs1, rhs2) = fmt ppf "%a ::= %a . %a @@%d" symbol n rhs (List.rev rhs1)  rhs rhs2 k
+
+    let item_seq ppf l = seq ~sep:item_sep item ppf l
+
+    let itemset tk ppf set =
+      let elts = ItemSet.elements set in
+      fmt ppf "@[%a@]" item_seq @@ List.map (fun (k,n,r1,r2) -> k,n,r1,tk::r2) elts
 
     let itemmap ppf (rs : itemmap) =
       let elts = ItemMap.bindings rs in
-      fmt ppf "@[%a@]" (seq ~sep:item_sep item) elts
+      fmt ppf "@[%a@]" item_seq @@ List.map (fun (tk, (k,n,r1,r2)) -> k,n,r1,tk::r2) elts
   (*
       fmt ppf "@[<2>%a@]" (fun r i -> item (r,i)) ItemMap.iter (fun )) rs
    *)
   end
-
+(*
   let get_previous_item previous tk r =
     let itemmap =
       try IntMap.find r previous with Not_found ->
@@ -281,7 +305,7 @@ module Make(T : TOKEN) = struct
     with Not_found ->
       let () = sfmt "rule for symbol %a not found in itemmap #%d" PP.symbol tk r in
       failwith (Format.flush_str_formatter ())
-
+ *)
   let symbol_eq x y = Symbol.compare x y = 0
 
   module First = struct
@@ -321,7 +345,7 @@ module Make(T : TOKEN) = struct
     let build rulemap : t =
       let rec build (smap : t) =
         let sm' = transitive_closure smap in
-        efmt "sm  = @[%a@]@.sm' = @[%a@]@.%!" pp smap pp sm';
+        (*        efmt "sm  = @[%a@]@.sm' = @[%a@]@.%!" pp smap pp sm'; *)
         if sm' == smap then sm' else build sm'
       in
       let fld k rhs maps =
@@ -350,10 +374,12 @@ module Make(T : TOKEN) = struct
 
     let pp_rev ppf rmap =
       let pp_set ppf set =
-        Rev.Set.iter (fun t -> fmt ppf "%a," PP.symbol t) set in
-      Rev.iter_set (fun t set -> fmt ppf "@[%a -> @[%a@]@]" PP.symbol t pp_set set) rmap
+        Rev.Set.iter (fun t -> fmt ppf ",%a" PP.symbol t) set in
+      Rev.iter_set (fun t set -> fmt ppf "@[%a -> @[%a@];@;@]" PP.symbol t pp_set set) rmap
 
   end
+
+  let shift x = function (k,s,l,r) -> (k,s,x::l,r)
 
   (* scanner:
    * returns sets of rules
@@ -362,14 +388,18 @@ module Make(T : TOKEN) = struct
    *)
   let scan (itemmap : itemmap) (sigma : Symbol.t) =
     let accepted, remaining =
-      ItemMap.partition (fun _ -> function (k,x::xs) -> symbol_eq x sigma | (k,[]) -> false) itemmap in
-    efmt "scan : accepted = %a (%a)\n" PP.itemmap accepted PP.symbol sigma;
-    let accepted = ItemMap.map (function (r,x::xs) -> (r,xs) | _ -> assert false) accepted in
-    let rec split tk (r,l) (active, completed) =
-      match l with
-        [] -> active, ItemSymbolSet.add (r,tk) completed
-      | x -> ItemMap.add tk (r,x) active, completed in
-    let active, completed = ItemMap.fold split accepted (ItemMap.empty,ItemSymbolSet.empty) in
+      try 
+        let a = ItemMap.find sigma itemmap in
+        a, ItemMap.remove sigma itemmap
+      with Not_found -> ItemSet.empty, itemmap
+    in
+    efmt "scan : accepted = %a (%a)\n" (PP.itemset sigma) accepted PP.symbol sigma;
+    let accepted : Item.t list = ItemSet.elements accepted |> List.map (shift sigma) in
+    let rec split (active, completed) ((k,n,l,r): Item.t) =
+      match r with
+        [] -> active, (k,n)::completed
+      | tk::xs -> ItemMap.add tk (k,n,l,xs) active, completed in
+    let active, completed = List.fold_left split (ItemMap.empty,[]) accepted in
     active, completed, remaining
 
   (* completer:
@@ -378,29 +408,30 @@ module Make(T : TOKEN) = struct
    * until there's no more completed items
    *)
   let rec complete active completed previous =
-    if ItemSymbolSet.is_empty completed
-    then active
-    else let r, tk = ItemSymbolSet.choose completed in
-         efmt "complete : choosing '%a'\n%!" PP.symbol tk;
-         let completed = ItemSymbolSet.remove (r,tk) completed in
-         let a, c, remaining = scan (IntMap.find r previous) tk in
-         (*         let previous = IntMap.add r remaining previous in  *)
-         complete (ItemMap.merge a active) (ItemSymbolSet.union completed c) previous
+    match completed with
+      [] -> active
+    | (r,tk)::completed ->
+       efmt "complete : choosing '%a' (%d)\n%!" PP.symbol tk r;
+       let a, c, remaining = scan (IntMap.find r previous) tk in
+       complete (ItemMap.merge a active) (List.append completed c) previous
 
   (* predictor:
    * return the set of rules potentially activated (no look-ahead)
    *)
+
+  let add_rules round itemmap rules sset =
+    let p, rules = RuleMap.partition (fun k _ -> SymbolSet.mem k sset) rules in
+    let p = RuleMap.fold (fun k -> function (x::rhs) -> ItemMap.add x (round,k,[],rhs) | _ -> assert false) p ItemMap.empty in
+    p, rules
+
   let rec predict round (rules : rulemap) activable (predicted : itemmap) (active : itemmap) =
-    let fld k (r,rhs) ts =
-       match rhs with
-         x::xs -> (*if not @@ First.Rev.Set.mem x activable then ts else *) SymbolMap.add x r ts
-       | [] -> assert false in
-    let ts = ItemMap.fold fld active SymbolMap.empty in
-    if SymbolMap.is_empty ts
+    let fld tk (k,n,l,r) ts =
+      if not @@ First.Rev.Set.mem tk activable then ts else SymbolSet.add tk ts in
+    let ts = ItemMap.fold fld active SymbolSet.empty in
+    if SymbolSet.is_empty ts
     then predicted
     else
-      let p, rules = RuleMap.partition (fun k _ -> SymbolMap.mem k ts) rules in
-      let p = RuleMap.fold (fun k rhs -> ItemMap.add k (round,rhs)) p ItemMap.empty in
+      let p, rules = add_rules round ItemMap.empty rules ts in
       predict round rules activable (ItemMap.merge predicted p) p
 
   let parse (rules : rulemap) first start lexbuf =
@@ -410,7 +441,8 @@ module Make(T : TOKEN) = struct
       | _, None -> ()
       | true, _ -> failwith "no active rules"
       | _, Some lx ->
-         let activable = First.Rev.find (Terminal lx) first in
+         let activable = try First.Rev.find (Terminal lx) first with Not_found -> failwith @@ Format.(fprintf str_formatter "unhandled lexeme %s" (T.to_string lx); flush_str_formatter ()) in
+         efmt "@[activable = %a@]@.%!" (fun ppf set -> First.Rev.Set.iter (fun sy -> fmt ppf "%a;@;" PP.symbol sy) set) activable;
          let predicted = predict round rules activable ItemMap.empty active in
          efmt "@[predicted = %a@]@.%!" PP.itemmap predicted;
          let itemmap = ItemMap.merge active predicted in
@@ -418,24 +450,26 @@ module Make(T : TOKEN) = struct
          let active, completed, remaining = scan itemmap (Terminal lx) in
          efmt "before completion\n%!";
          efmt "active = @[%a@]\n%!" PP.itemmap active;
-         efmt "completed = @[%a@]\n%!" (PP.itemsymbolset ";") completed;
+         efmt "completed = @[%a@]\n%!" PP.completed_list completed;
          efmt "remaining = @[%a@]\n%!" PP.itemmap remaining;
          let previous = IntMap.add round itemmap previous in
          let active = complete active completed previous in
          efmt "after completion\n%!";
          efmt "active = @[%a@]\n%!" PP.itemmap active;
-         efmt "completed = @[%a@]\n%!" (PP.itemsymbolset ";") completed;
+         efmt "completed = @[%a@]\n%!" PP.completed_list completed;
          prerr_endline "---------------";
          IntMap.iter (fun m im -> efmt "@[<2>previous #%d = @,%a@]\n%!" m PP.itemmap im) previous;
          parse (succ round) previous active lexbuf
     in
+    let active, _ = add_rules 1 ItemMap.empty rules (SymbolSet.singleton start) in
+    (*
     let rhs = RuleMap.(find start rules |> Set.elements) in
-    let items = List.map (fun rhs -> 1, rhs) rhs in
+    let items = List.map (fun rhs -> 1, [], rhs) rhs in
     let active = ItemMap.(add_list start items empty) in
+     *)
     parse 1 (IntMap.singleton 1 active) active lexbuf
 
 end
-
 
 module Test = struct
 
@@ -490,6 +524,6 @@ module Test = struct
     parse rulemap1 first1 (nt 'S') {pos=0;data="a+a-a"};
     efmt "----------------------------------------------------\n"; 
     efmt "first2 = @[%a@]\n" First.pp_rev first2;
-    parse rulemap2 first2 (nt 'S') {pos=0;data="q"};
+    parse rulemap2 first2 (nt 'T') {pos=0;data="q"};
 
 end
