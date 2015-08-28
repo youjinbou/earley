@@ -1,0 +1,2 @@
+A simple Earley style parser/recoginzer. The grammar is provided as a list of list of list of rules. The parser itself is a functor taking 3 modules : 1 for the tokenizer, 1 for grammar symbols, and 1 for the parser actions/ tree generation.
+
